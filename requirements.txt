@@ -1,4 +1,26 @@
+# ============================================================
+# Multilingual Social Media OCR Dependencies
+# English | Hindi | Marathi
+# ============================================================
+
+# Core OCR Engine and Image Processing
 paddleocr>=3.7.0
-paddlepaddle-gpu>=3.3.1; sys_platform == 'win32'
 opencv-python>=4.10.0
 pillow>=10.0.0
+
+# Database Persistence and Queue Management
+mariadb>=1.1.10
+
+# ============================================================
+# Deep Learning Framework: PaddlePaddle
+# Choose EITHER Option A (CPU) OR Option B (GPU) below:
+# ============================================================
+
+# Option A: CPU Default (For local machines & servers without CUDA GPU)
+paddlepaddle>=3.3.0
+
+# Option B: NVIDIA GPU Acceleration (CUDA 11.8 / 12.x)
+# If using NVIDIA CUDA, install paddlepaddle-gpu instead of paddlepaddle:
+# Example for CUDA 12.x wheels on Windows/Linux:
+#   pip install paddlepaddle-gpu>=3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+# paddlepaddle-gpu>=3.3.0

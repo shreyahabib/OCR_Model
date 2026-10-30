@@ -2,26 +2,36 @@ import os
 import sys
 import json
 import time
+import uuid
+import shutil
+import argparse
 from pathlib import Path
 
-# Ensure proper UTF-8 output for English, Hindi, and Marathi text.
+# Set before importing PaddleOCR.
+os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "False"
+
+import cv2
+import mariadb
+import paddle
+from paddleocr import PaddleOCR
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-# Disable MKLDNN optimizations that may cause compatibility issues.
-os.environ["FLAGS_use_mkldnn"] = "0"
-os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "uploads"
+RESULT_DIR = BASE_DIR / "results"
 
-import cv2
-from paddleocr import PaddleOCR
-
-
-# ============================================================
-# VIDEO OPTIMIZATION SETTINGS
-# ============================================================
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 FRAME_INTERVAL = 1.0
 FRAME_DIFF_THRESHOLD = 5.0
@@ -30,8 +40,16 @@ MAX_OCR_INTERVAL = 2.0
 COMPARE_WIDTH = 160
 COMPARE_HEIGHT = 90
 
-# Current tested batch size.
-OCR_BATCH_SIZE = 1
+OCR_BATCH_SIZE = 2
+CPU_THREADS = 4
+
+MAX_UPLOAD_BYTES = int(
+    os.getenv("OCR_MAX_UPLOAD_BYTES", str(200 * 1024 * 1024))
+)
+
+WORKER_POLL_SECONDS = float(
+    os.getenv("OCR_WORKER_POLL_SECONDS", "2")
+)
 
 IMAGE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".bmp",
@@ -43,24 +61,161 @@ VIDEO_EXTENSIONS = {
     ".mkv", ".webm", ".m4v"
 }
 
+MARIADB_CONFIG = {
+    "host": os.getenv("OCR_DB_HOST", "127.0.0.1"),
+    "port": int(os.getenv("OCR_DB_PORT", "3307")),
+    "user": os.getenv("OCR_DB_USER", "root"),
+    "password": os.getenv("OCR_DB_PASSWORD", "Shreya@123_"),
+    "database": os.getenv("OCR_DB_NAME", "ocr_database"),
+    "connect_timeout": 10,
+}
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+def log(message):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}", flush=True)
+
+
+# ============================================================
+# CPU / GPU SELECTION
+# ============================================================
+
+def choose_ocr_device():
+    while True:
+        print("\n========== SELECT OCR DEVICE ==========")
+        print("1. CPU")
+        print("2. GPU")
+        print("=======================================")
+
+        choice = input("Choose CPU or GPU: ").strip().lower()
+
+        if choice in ("1", "cpu"):
+            log("Selected OCR device: CPU")
+            return "cpu"
+
+        if choice in ("2", "gpu"):
+            try:
+                if not paddle.is_compiled_with_cuda():
+                    log("GPU unavailable: PaddlePaddle has no CUDA support.")
+                    continue
+
+                gpu_count = paddle.device.cuda.device_count()
+
+                if gpu_count < 1:
+                    log("No CUDA GPU detected.")
+                    continue
+
+                log(f"Selected GPU 0 of {gpu_count} detected GPU(s).")
+                return "gpu:0"
+
+            except Exception as exc:
+                log(f"GPU verification failed: {exc}")
+                continue
+
+        print("Invalid choice. Enter CPU, GPU, 1 or 2.")
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def get_db_connection():
+    return mariadb.connect(**MARIADB_CONFIG)
+
+
+def initialize_database():
+    started = time.perf_counter()
+    connection = get_db_connection()
+
+    try:
+        cursor = connection.cursor()
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ocr_jobs (
+                id CHAR(36) PRIMARY KEY,
+                original_filename VARCHAR(255) NOT NULL,
+                stored_filename VARCHAR(255) NOT NULL,
+
+                status ENUM(
+                    'queued',
+                    'processing',
+                    'completed',
+                    'failed'
+                ) NOT NULL DEFAULT 'queued',
+
+                result_json LONGTEXT NULL,
+                error_text TEXT NULL,
+
+                created_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                updated_at TIMESTAMP NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
+                    ON UPDATE CURRENT_TIMESTAMP,
+
+                INDEX idx_status_created (status, created_at)
+            ) ENGINE=InnoDB
+              DEFAULT CHARSET=utf8mb4
+              COLLATE=utf8mb4_unicode_ci
+        """)
+
+        connection.commit()
+        cursor.close()
+
+        elapsed = time.perf_counter() - started
+        log(f"Database initialization completed in {elapsed:.3f}s")
+
+    finally:
+        connection.close()
+
+
+# ============================================================
+# OCR MODEL
+# ============================================================
+
+def load_ocr_model(device):
+    log(f"Loading PaddleOCR on {device.upper()}...")
+
+    started = time.perf_counter()
+
+    options = {
+        "lang": "hi",
+        "ocr_version": "PP-OCRv5",
+        "device": device,
+        "use_doc_unwarping": False,
+        "use_doc_orientation_classify": False,
+    }
+
+    if device == "cpu":
+        options["cpu_threads"] = CPU_THREADS
+        options["enable_mkldnn"] = False
+
+    ocr = PaddleOCR(**options)
+
+    elapsed = time.perf_counter() - started
+
+    log(f"OCR model loaded in {elapsed:.3f}s")
+    log(f"OCR device: {device.upper()}")
+
+    return ocr, elapsed
+
 
 # ============================================================
 # TEXT EXTRACTION
 # ============================================================
 
 def extract_text(result):
-    """Extract recognized text and confidence values from PaddleOCR output."""
+    data = getattr(result, "json", None)
 
-    data = None
-
-    if hasattr(result, "json"):
-        data = result.json
-
-        if callable(data):
-            try:
-                data = data()
-            except Exception:
-                data = None
+    if callable(data):
+        try:
+            data = data()
+        except Exception:
+            data = None
 
     if isinstance(data, str):
         try:
@@ -81,51 +236,61 @@ def extract_text(result):
 
     extracted = []
 
-    for i, recognized_text in enumerate(texts):
+    for index, recognized_text in enumerate(texts):
         recognized_text = str(recognized_text).strip()
 
         if not recognized_text:
             continue
 
         try:
-            score = (
-                float(scores[i])
-                if i < len(scores)
+            confidence = (
+                float(scores[index])
+                if index < len(scores)
                 else None
             )
         except (TypeError, ValueError):
-            score = None
+            confidence = None
 
         extracted.append({
             "text": recognized_text,
-            "confidence": score
+            "confidence": confidence
         })
 
     return extracted
 
 
 # ============================================================
-# OCR PREDICTION HELPER
+# OCR BATCH PREDICTION WITH FALLBACK
 # ============================================================
 
 def predict_frames(ocr, frames):
-    """Predict OCR for frames, trying batching and falling back safely."""
-
     if not frames:
         return [], "none"
 
-    # Process a single frame directly.
     if len(frames) == 1:
-        frame_text = []
+        started = time.perf_counter()
+        extracted = []
 
         for result in ocr.predict(frames[0]):
-            frame_text.extend(extract_text(result))
+            extracted.extend(extract_text(result))
 
-        return [frame_text], "single-frame"
+        log(
+            f"OCR inference: 1 frame | "
+            f"{time.perf_counter() - started:.3f}s"
+        )
 
-    # Try batch prediction.
+        return [extracted], "single-frame"
+
+    batch_started = time.perf_counter()
+
     try:
         batch_results = list(ocr.predict(frames))
+        elapsed = time.perf_counter() - batch_started
+
+        log(
+            f"OCR batch inference: {len(frames)} frames | "
+            f"{elapsed:.3f}s"
+        )
 
         if len(batch_results) == len(frames):
             return [
@@ -133,57 +298,58 @@ def predict_frames(ocr, frames):
                 for result in batch_results
             ], "batch"
 
-        print(
-            f"Batch returned {len(batch_results)} results for "
-            f"{len(frames)} frames. Using individual-frame fallback."
-        )
+        log("Batch result count mismatch. Using fallback.")
 
-    except Exception as error:
-        print("Batch prediction failed; using individual-frame fallback.")
-        print(f"Details: {type(error).__name__}: {error}")
+    except Exception as exc:
+        elapsed = time.perf_counter() - batch_started
+        log(f"Batch OCR failed after {elapsed:.3f}s: {exc}")
+        log("Using individual-frame fallback.")
 
-    # Compatibility fallback: process frames individually.
-    extracted = []
+    extracted_frames = []
 
-    for frame in frames:
-        frame_text = []
+    for index, frame in enumerate(frames, start=1):
+        started = time.perf_counter()
+        extracted = []
 
         for result in ocr.predict(frame):
-            frame_text.extend(extract_text(result))
+            extracted.extend(extract_text(result))
 
-        extracted.append(frame_text)
+        log(
+            f"Fallback frame {index}/{len(frames)}: "
+            f"{time.perf_counter() - started:.3f}s"
+        )
 
-    return extracted, "single-frame fallback"
+        extracted_frames.append(extracted)
 
+    return extracted_frames, "single-frame fallback"
 
 # ============================================================
 # IMAGE OCR
 # ============================================================
 
 def process_image(ocr, file_path):
-    """Run OCR on a single image."""
+    log(f"Processing image: {file_path.name}")
 
-    print("\nProcessing image...")
-
+    started = time.perf_counter()
     all_results = []
 
     for result in ocr.predict(str(file_path)):
         all_results.extend(extract_text(result))
 
-    return all_results
+    elapsed = time.perf_counter() - started
+    log(f"Image OCR inference time: {elapsed:.3f}s")
+
+    return all_results, {
+        "processing_time_seconds": round(elapsed, 3)
+    }
 
 
 # ============================================================
-# VIDEO OCR
+# VIDEO OCR WITH FRAME COMPARISON AND BATCHING
 # ============================================================
 
 def process_video(ocr, file_path):
-    """
-    Sample video frames, skip visually similar frames,
-    and run OCR on selected frames.
-    """
-
-    print("\nProcessing video...")
+    log(f"Processing video: {file_path.name}")
 
     cap = cv2.VideoCapture(str(file_path))
 
@@ -201,6 +367,13 @@ def process_video(ocr, file_path):
     single_frame_calls = 0
     batch_fallbacks = 0
 
+    seek_time = 0.0
+    decode_time = 0.0
+    preprocess_time = 0.0
+    comparison_time = 0.0
+    ocr_total_time = 0.0
+    result_handling_time = 0.0
+
     pending_frames = []
     pending_timestamps = []
 
@@ -215,24 +388,26 @@ def process_video(ocr, file_path):
 
         duration = total_frames / fps
 
-        print(f"Video FPS: {fps:.2f}")
-        print(f"Video duration: {duration:.2f} seconds")
-        print(f"Sampling interval: {FRAME_INTERVAL:.2f} seconds")
-        print(f"Frame difference threshold: {FRAME_DIFF_THRESHOLD:.2f}")
-        print(f"Maximum OCR interval: {MAX_OCR_INTERVAL:.2f} seconds")
-        print(f"OCR batch size: {OCR_BATCH_SIZE}")
+        log(f"Video FPS: {fps:.2f}")
+        log(f"Video duration: {duration:.2f}s")
+        log(f"Sampling interval: {FRAME_INTERVAL:.2f}s")
+        log(f"Frame difference threshold: {FRAME_DIFF_THRESHOLD}")
+        log(f"Maximum OCR interval: {MAX_OCR_INTERVAL:.2f}s")
+        log(f"OCR batch size: {OCR_BATCH_SIZE}")
 
         previous_gray = None
         last_ocr_timestamp = None
         timestamp = 0.0
 
-        processing_start = time.perf_counter()
+        processing_started = time.perf_counter()
 
         def flush_pending():
             nonlocal processed_frames
             nonlocal batch_calls
             nonlocal single_frame_calls
             nonlocal batch_fallbacks
+            nonlocal ocr_total_time
+            nonlocal result_handling_time
 
             if not pending_frames:
                 return
@@ -240,22 +415,21 @@ def process_video(ocr, file_path):
             frames = list(pending_frames)
             timestamps = list(pending_timestamps)
 
+            started = time.perf_counter()
             results_by_frame, method = predict_frames(ocr, frames)
+            ocr_total_time += time.perf_counter() - started
+
+            result_started = time.perf_counter()
 
             if method == "batch":
                 batch_calls += 1
-                print(f"Batch processed {len(frames)} frames.")
 
             elif method == "single-frame fallback":
                 batch_fallbacks += 1
                 single_frame_calls += len(frames)
-                print("Queued frames processed individually.")
 
             else:
                 single_frame_calls += len(frames)
-
-            while len(results_by_frame) < len(timestamps):
-                results_by_frame.append([])
 
             for frame_time, items in zip(
                 timestamps, results_by_frame
@@ -271,18 +445,41 @@ def process_video(ocr, file_path):
             pending_frames.clear()
             pending_timestamps.clear()
 
-        # Sample frames at the configured interval.
+            result_handling_time += (
+                time.perf_counter() - result_started
+            )
+
         while timestamp < duration:
-            cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+
+            # Directly seek to the required timestamp.
+            started = time.perf_counter()
+
+            cap.set(
+                cv2.CAP_PROP_POS_MSEC,
+                timestamp * 1000
+            )
+
+            seek_time += time.perf_counter() - started
+
+            # Decode the selected frame.
+            started = time.perf_counter()
+
             ok, frame = cap.read()
 
+            decode_time += time.perf_counter() - started
+
             if not ok or frame is None:
-                print(f"Could not read frame at {timestamp:.2f}s.")
                 break
 
             sampled_frames += 1
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # Resize grayscale frame for faster comparison.
+            started = time.perf_counter()
+
+            gray = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2GRAY
+            )
 
             gray_small = cv2.resize(
                 gray,
@@ -290,8 +487,12 @@ def process_video(ocr, file_path):
                 interpolation=cv2.INTER_AREA
             )
 
+            preprocess_time += time.perf_counter() - started
+
+            # Compare with the previous sampled frame.
+            started = time.perf_counter()
+
             should_run_ocr = False
-            difference_score = None
             reason = ""
 
             if previous_gray is None:
@@ -299,19 +500,18 @@ def process_video(ocr, file_path):
                 reason = "first frame"
 
             else:
-                difference = cv2.absdiff(
-                    gray_small, previous_gray
+                difference_score = float(
+                    cv2.absdiff(
+                        previous_gray,
+                        gray_small
+                    ).mean()
                 )
-
-                difference_score = float(difference.mean())
 
                 if difference_score >= FRAME_DIFF_THRESHOLD:
                     should_run_ocr = True
-                    reason = "significant visual change"
+                    reason = "visual difference detected"
 
-                # Periodically run OCR even when the frame difference
-                # is small, so persistent text is not missed indefinitely.
-                if (
+                elif (
                     last_ocr_timestamp is not None
                     and timestamp - last_ocr_timestamp
                     >= MAX_OCR_INTERVAL
@@ -319,13 +519,13 @@ def process_video(ocr, file_path):
                     should_run_ocr = True
                     reason = "maximum OCR interval reached"
 
+            comparison_time += time.perf_counter() - started
+
             if should_run_ocr:
-                message = f"Queueing frame at {timestamp:.2f}s"
-
-                if difference_score is not None:
-                    message += f" | difference: {difference_score:.2f}"
-
-                print(f"{message} | reason: {reason}")
+                log(
+                    f"Queueing frame at {timestamp:.2f}s "
+                    f"| reason: {reason}"
+                )
 
                 pending_frames.append(frame)
                 pending_timestamps.append(timestamp)
@@ -336,21 +536,20 @@ def process_video(ocr, file_path):
                     flush_pending()
 
             else:
-                print(
+                skipped_frames += 1
+
+                log(
                     f"Skipping OCR at {timestamp:.2f}s "
                     f"| difference: {difference_score:.2f}"
                 )
 
-                skipped_frames += 1
-
-            # Compare the next sampled frame with this one.
             previous_gray = gray_small
             timestamp += FRAME_INTERVAL
 
-        # Process any remaining frames.
+        # Process remaining frames.
         flush_pending()
 
-        processing_time = time.perf_counter() - processing_start
+        processing_time = time.perf_counter() - processing_started
 
         stats = {
             "video_duration_seconds": round(duration, 3),
@@ -365,24 +564,31 @@ def process_video(ocr, file_path):
             "batch_calls": batch_calls,
             "single_frame_calls": single_frame_calls,
             "batch_fallbacks": batch_fallbacks,
-            "processing_time_seconds": round(processing_time, 3)
+            "processing_time_seconds": round(processing_time, 3),
+            "detailed_timing_seconds": {
+                "video_seeking": round(seek_time, 3),
+                "frame_decoding": round(decode_time, 3),
+                "preprocessing": round(preprocess_time, 3),
+                "frame_comparison": round(comparison_time, 3),
+                "ocr_inference": round(ocr_total_time, 3),
+                "result_handling": round(result_handling_time, 3)
+            }
         }
+
+        log("========== VIDEO PROCESSING SUMMARY ==========")
+        log(f"Sampled frames: {sampled_frames}")
+        log(f"OCR processed frames: {processed_frames}")
+        log(f"Skipped frames: {skipped_frames}")
+        log(f"Batch calls: {batch_calls}")
+        log(f"Batch fallbacks: {batch_fallbacks}")
+        log(f"Total processing time: {processing_time:.3f}s")
+        log(f"OCR inference time: {ocr_total_time:.3f}s")
+        log("===============================================")
+
+        return all_results, stats
 
     finally:
         cap.release()
-
-    print("\n========== VIDEO PROCESSING SUMMARY ==========")
-    print(f"Video duration      : {stats['video_duration_seconds']:.2f} seconds")
-    print(f"Sampled frames      : {stats['sampled_frames']}")
-    print(f"Frames sent to OCR  : {stats['ocr_processed_frames']}")
-    print(f"Frames skipped      : {stats['skipped_frames']}")
-    print(f"Batch calls         : {stats['batch_calls']}")
-    print(f"Single-frame calls  : {stats['single_frame_calls']}")
-    print(f"Batch fallbacks     : {stats['batch_fallbacks']}")
-    print(f"Processing time     : {stats['processing_time_seconds']:.3f} seconds")
-    print("==============================================")
-
-    return all_results, stats
 
 
 # ============================================================
@@ -390,9 +596,7 @@ def process_video(ocr, file_path):
 # ============================================================
 
 def detect_file_type(file_path):
-    """Return image/video type, or None for unsupported extensions."""
-
-    extension = file_path.suffix.lower()
+    extension = Path(file_path).suffix.lower()
 
     if extension in IMAGE_EXTENSIONS:
         return "image"
@@ -404,27 +608,39 @@ def detect_file_type(file_path):
 
 
 # ============================================================
-# PROCESS ONE FILE AND DISPLAY COMPLETE EXTRACTED TEXT
+# PROCESS ONE QUEUED FILE
 # ============================================================
 
 def process_one_file(ocr, file_path, file_type, model_load_time):
-    """Process one file, display all recognized text, and save JSON."""
+    file_path = Path(file_path)
+    started = time.perf_counter()
 
-    file_start = time.perf_counter()
-    processing_start = time.perf_counter()
-
-    video_stats = None
+    log(f"Starting OCR job for: {file_path.name}")
 
     if file_type == "image":
-        all_results = process_image(ocr, file_path)
+        extracted, statistics = process_image(
+            ocr,
+            file_path
+        )
+        video_stats = None
+
+    elif file_type == "video":
+        extracted, video_stats = process_video(
+            ocr,
+            file_path
+        )
+        statistics = video_stats
+
     else:
-        all_results, video_stats = process_video(ocr, file_path)
+        raise ValueError(f"Unsupported file type: {file_type}")
 
-    processing_time = time.perf_counter() - processing_start
-
-    output_path = file_path.with_name(
-        file_path.stem + "_ocr_results.json"
+    complete_text = "\n".join(
+        item["text"]
+        for item in extracted
+        if item.get("text", "").strip()
     )
+
+    processing_time = time.perf_counter() - started
 
     output = {
         "input_file": file_path.name,
@@ -433,183 +649,557 @@ def process_one_file(ocr, file_path, file_type, model_load_time):
         "model_load_time_seconds": round(model_load_time, 3),
         "model_reused": True,
         "processing_time_seconds": round(processing_time, 3),
-        "total_time_seconds": None,
         "video_statistics": video_stats,
-        "extracted_text": all_results
+        "statistics": statistics,
+        "extracted_text": extracted,
+        "complete_extracted_text": complete_text
     }
 
-    # Display individual OCR results.
-    print("\n" + "=" * 60)
-    print("                     OCR RESULTS")
-    print("=" * 60)
+    log("========== EXTRACTED TEXT ==========")
+    print(complete_text or "No text detected.", flush=True)
+    log("====================================")
 
-    if not all_results:
-        print("No text detected in the input file.")
+    log(f"OCR processing completed in {processing_time:.3f}s")
 
-    else:
-        for i, item in enumerate(all_results, start=1):
-
-            if "timestamp_seconds" in item:
-                print(
-                    f"\n{i}. Timestamp: "
-                    f"{item['timestamp_seconds']} seconds"
-                )
-            else:
-                print(f"\n{i}.")
-
-            print(f"   Text: {item['text']}")
-
-            if item.get("confidence") is not None:
-                print(f"   Confidence: {item['confidence']:.2%}")
-
-    # NEW FEATURE:
-    # Combine all recognized text into one complete text section.
-    complete_text = "\n".join(
-        item["text"]
-        for item in all_results
-        if item.get("text", "").strip()
-    )
-
-    print("\n" + "=" * 60)
-    print("                COMPLETE EXTRACTED TEXT")
-    print("=" * 60)
-
-    if complete_text:
-        print(complete_text)
-    else:
-        print("No text detected.")
-
-    print("=" * 60)
-
-    # Save all results, including the complete extracted text, to JSON.
-    output["complete_extracted_text"] = complete_text
-
-    # Include JSON-writing time in total_time_seconds.
-    output["total_time_seconds"] = round(
-        time.perf_counter() - file_start, 3
-    )
-
-    with output_path.open("w", encoding="utf-8") as file:
-        json.dump(output, file, ensure_ascii=False, indent=2)
-
-    # Display performance information.
-    print("\n" + "-" * 60)
-    print(
-        f"Model loading time (startup, once): "
-        f"{model_load_time:.3f} seconds"
-    )
-    print(f"OCR processing time for this file: {processing_time:.3f} seconds")
-    print(
-        f"Per-file total time              : "
-        f"{output['total_time_seconds']:.3f} seconds"
-    )
-
-    if video_stats is not None:
-        print(f"Sampled frames                   : {video_stats['sampled_frames']}")
-        print(f"Frames sent to OCR               : {video_stats['ocr_processed_frames']}")
-        print(f"Frames skipped                   : {video_stats['skipped_frames']}")
-        print(f"Batch calls                      : {video_stats['batch_calls']}")
-        print(f"Single-frame calls               : {video_stats['single_frame_calls']}")
-        print(f"Batch fallbacks                  : {video_stats['batch_fallbacks']}")
-
-    print(f"JSON output saved                : {output_path.resolve()}")
-    print("-" * 60)
-
+    return output
 
 # ============================================================
-# MAIN APPLICATION - PERSISTENT MODEL MODE
+# SUBMIT JOB TO MARIADB
 # ============================================================
 
-def main():
-    print("=" * 60)
-    print("          MULTILINGUAL SOCIAL MEDIA OCR")
-    print("          English | Hindi | Marathi")
-    print("          Persistent Model Mode")
-    print("=" * 60)
+def submit_job(source_path):
+    started = time.perf_counter()
 
-    print("The OCR model will load once and be reused for each file.")
-    print("Type 'exit', 'quit', or 'q' to close the application.\n")
+    source_path = Path(source_path).expanduser()
 
-    print("Loading OCR model...")
-
-    model_start = time.perf_counter()
-
-    try:
-        ocr = PaddleOCR(
-            lang="hi",
-            ocr_version="PP-OCRv5",
-            device="gpu",
-            use_doc_unwarping=False,
-            use_doc_orientation_classify=False
-        )
-
-    except Exception as error:
-        print(
-            f"\nERROR while loading OCR model: "
-            f"{type(error).__name__}: {error}"
-        )
-        print("Check your PaddleOCR installation and device configuration.")
+    if not source_path.is_file():
+        log(f"File not found: {source_path}")
         return
 
-    model_load_time = time.perf_counter() - model_start
+    file_type = detect_file_type(source_path)
 
-    print(f"Model loaded in {model_load_time:.3f} seconds.\n")
+    if file_type is None:
+        log("Unsupported file type.")
+        log("Supported images: PNG, JPG, JPEG, BMP, WEBP, TIF, TIFF")
+        log("Supported videos: MP4, AVI, MOV, MKV, WEBM, M4V")
+        return
 
-    files_processed = 0
+    file_size = source_path.stat().st_size
+
+    if file_size > MAX_UPLOAD_BYTES:
+        log(
+            f"File is too large. Maximum allowed size: "
+            f"{MAX_UPLOAD_BYTES / (1024 * 1024):.0f} MB"
+        )
+        return
+
+    job_id = str(uuid.uuid4())
+
+    # Give the stored file a unique name to avoid filename conflicts.
+    stored_filename = (
+        f"{job_id}{source_path.suffix.lower()}"
+    )
+
+    destination = UPLOAD_DIR / stored_filename
+
+    copy_started = time.perf_counter()
+
+    shutil.copy2(source_path, destination)
+
+    copy_time = time.perf_counter() - copy_started
+
+    log(f"File copied to uploads: {destination}")
+    log(f"File copy time: {copy_time:.3f}s")
+
+    connection = None
+
+    try:
+        db_started = time.perf_counter()
+
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO ocr_jobs (
+                id,
+                original_filename,
+                stored_filename,
+                status
+            )
+            VALUES (?, ?, ?, 'queued')
+            """,
+            (
+                job_id,
+                source_path.name,
+                stored_filename
+            )
+        )
+
+        connection.commit()
+        cursor.close()
+
+        db_time = time.perf_counter() - db_started
+        total_time = time.perf_counter() - started
+
+        log("========== JOB SUBMITTED ==========")
+        log(f"Job ID: {job_id}")
+        log(f"Filename: {source_path.name}")
+        log(f"File type: {file_type}")
+        log("Status: QUEUED")
+        log(f"Database insertion time: {db_time:.3f}s")
+        log(f"Total submission time: {total_time:.3f}s")
+        log("===================================")
+
+    except Exception:
+        # If database insertion fails, remove the copied file.
+        if destination.exists():
+            destination.unlink()
+
+        raise
+
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+# ============================================================
+# CHECK JOB STATUS
+# ============================================================
+
+def show_job_status(job_id):
+    started = time.perf_counter()
+
+    connection = get_db_connection()
+
+    try:
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                original_filename,
+                status,
+                error_text,
+                created_at,
+                updated_at
+            FROM ocr_jobs
+            WHERE id = ?
+            """,
+            (job_id,)
+        )
+
+        row = cursor.fetchone()
+        cursor.close()
+
+        if row is None:
+            log(f"No job found with ID: {job_id}")
+            return
+
+        print("\n========== JOB STATUS ==========")
+        print(f"Job ID: {row[0]}")
+        print(f"Filename: {row[1]}")
+        print(f"Status: {row[2]}")
+        print(f"Error: {row[3] or 'None'}")
+        print(f"Created at: {row[4]}")
+        print(f"Updated at: {row[5]}")
+        print("================================")
+
+        log(
+            f"Status lookup completed in "
+            f"{time.perf_counter() - started:.3f}s"
+        )
+
+    finally:
+        connection.close()
+
+
+# ============================================================
+# CLAIM NEXT QUEUED JOB
+# ============================================================
+
+def claim_next_job():
+    """
+    Atomically claim the oldest queued job.
+
+    The row lock prevents two workers from claiming
+    the same job at the same time.
+    """
+
+    started = time.perf_counter()
+    connection = get_db_connection()
+
+    try:
+        connection.begin()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                original_filename,
+                stored_filename
+            FROM ocr_jobs
+            WHERE status = 'queued'
+            ORDER BY created_at ASC
+            LIMIT 1
+            FOR UPDATE
+            """
+        )
+
+        row = cursor.fetchone()
+
+        if row is None:
+            connection.commit()
+            cursor.close()
+            return None
+
+        job = {
+            "id": row[0],
+            "original_filename": row[1],
+            "stored_filename": row[2]
+        }
+
+        cursor.execute(
+            """
+            UPDATE ocr_jobs
+            SET status = 'processing',
+                error_text = NULL
+            WHERE id = ?
+              AND status = 'queued'
+            """,
+            (job["id"],)
+        )
+
+        if cursor.rowcount != 1:
+            connection.rollback()
+            cursor.close()
+            return None
+
+        connection.commit()
+        cursor.close()
+
+        elapsed = time.perf_counter() - started
+
+        log(
+            f"Job claimed: {job['id']} "
+            f"| claim time: {elapsed:.3f}s"
+        )
+
+        return job
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
+
+# ============================================================
+# UPDATE JOB IN MARIADB
+# ============================================================
+
+def update_job(job_id, status, result_json=None, error_text=None):
+    started = time.perf_counter()
+
+    connection = get_db_connection()
+
+    try:
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            UPDATE ocr_jobs
+            SET status = ?,
+                result_json = ?,
+                error_text = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                result_json,
+                error_text,
+                job_id
+            )
+        )
+
+        connection.commit()
+        cursor.close()
+
+        elapsed = time.perf_counter() - started
+
+        log(
+            f"Database job update: {status.upper()} "
+            f"| {elapsed:.3f}s"
+        )
+
+    finally:
+        connection.close()
+
+
+# ============================================================
+# PROCESS ONE QUEUED JOB
+# ============================================================
+
+def process_queued_job(ocr, model_load_time, job):
+    job_id = job["id"]
+
+    started = time.perf_counter()
+
+    stored_path = UPLOAD_DIR / job["stored_filename"]
+
+    log("\n========================================")
+    log(f"WORKER PROCESSING JOB: {job_id}")
+    log(f"Original file: {job['original_filename']}")
+    log(f"Stored file: {stored_path}")
+    log("Status: PROCESSING")
+    log("========================================")
+
+    try:
+        if not stored_path.is_file():
+            raise FileNotFoundError(
+                f"Uploaded file not found: {stored_path}"
+            )
+
+        file_type = detect_file_type(stored_path)
+
+        if file_type is None:
+            raise ValueError("Unsupported file extension.")
+
+        # Perform OCR using the already-loaded model.
+        output = process_one_file(
+            ocr,
+            stored_path,
+            file_type,
+            model_load_time
+        )
+
+        # Add job information to the output.
+        output["job_id"] = job_id
+        output["original_filename"] = job["original_filename"]
+
+        # Save the JSON result using the job ID.
+        result_path = RESULT_DIR / f"{job_id}_ocr_results.json"
+
+        json_started = time.perf_counter()
+
+        serialized_result = json.dumps(
+            output,
+            ensure_ascii=False,
+            indent=2
+        )
+
+        result_path.write_text(
+            serialized_result,
+            encoding="utf-8"
+        )
+
+        json_time = time.perf_counter() - json_started
+
+        log(f"JSON result saved: {result_path}")
+        log(f"JSON serialization and write time: {json_time:.3f}s")
+
+        # Store the result in MariaDB as well.
+        update_job(
+            job_id=job_id,
+            status="completed",
+            result_json=serialized_result,
+            error_text=None
+        )
+
+        total_time = time.perf_counter() - started
+
+        log("========== JOB COMPLETED ==========")
+        log(f"Job ID: {job_id}")
+        log(f"Result file: {result_path}")
+        log(f"Total worker processing time: {total_time:.3f}s")
+        log("Status: COMPLETED")
+        log("===================================")
+
+        # The uploaded input is intentionally retained.
+        # Remove it manually after confirming the result if desired.
+
+    except Exception as exc:
+        error_message = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        log(f"JOB FAILED: {error_message}")
+
+        try:
+            update_job(
+                job_id=job_id,
+                status="failed",
+                result_json=None,
+                error_text=error_message
+            )
+
+        except Exception as db_exc:
+            log(
+                f"Could not update failed job in database: {db_exc}"
+            )
+
+        log(f"Total time before failure: {time.perf_counter() - started:.3f}s")
+
+
+# ============================================================
+# CONTINUOUS WORKER LOOP
+# ============================================================
+
+def worker_loop():
+    print("\n" + "=" * 60)
+    print("MULTILINGUAL SOCIAL MEDIA OCR - WORKER")
+    print("=" * 60)
+
+    log("Initializing worker process...")
+
+    initialize_database()
+
+    # Select device and load model only once per worker process.
+    device = choose_ocr_device()
+
+    ocr, model_load_time = load_ocr_model(device)
+
+    log("Worker is ready.")
+    log(f"Polling interval: {WORKER_POLL_SECONDS:.1f}s")
+    log("Waiting for queued jobs...")
+    log("Press CTRL+C to stop the worker.")
+
+    jobs_processed = 0
+
+    try:
+        while True:
+            poll_started = time.perf_counter()
+
+            try:
+                job = claim_next_job()
+
+                if job is None:
+                    log("No queued jobs. Waiting...")
+                    time.sleep(WORKER_POLL_SECONDS)
+                    continue
+
+                process_queued_job(
+                    ocr,
+                    model_load_time,
+                    job
+                )
+
+                jobs_processed += 1
+
+                log(f"Jobs handled in this session: {jobs_processed}")
+
+            except mariadb.Error as exc:
+                log(f"MariaDB worker error: {exc}")
+                log(
+                    f"Retrying after {WORKER_POLL_SECONDS:.1f}s..."
+                )
+                time.sleep(WORKER_POLL_SECONDS)
+
+            except Exception as exc:
+                log(
+                    f"Unexpected worker error: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                time.sleep(WORKER_POLL_SECONDS)
+
+            poll_time = time.perf_counter() - poll_started
+
+            log(f"Worker loop cycle time: {poll_time:.3f}s")
+
+    except KeyboardInterrupt:
+        log("Worker shutdown requested.")
+
+    finally:
+        log(f"Total jobs handled in this session: {jobs_processed}")
+        log("Worker stopped.")
+
+
+# ============================================================
+# TERMINAL 1 - JOB SUBMISSION MODE
+# ============================================================
+
+def submitter_loop():
+    print("\n" + "=" * 60)
+    print("MULTILINGUAL SOCIAL MEDIA OCR")
+    print("JOB SUBMISSION MODE")
+    print("=" * 60)
+
+    initialize_database()
+
+    log("Submitter is ready.")
+    log("Enter an image/video path to add a job to MariaDB.")
+    log("Enter 'status' to check a job.")
+    log("Enter 'exit' to close the submitter.")
 
     while True:
         try:
-            raw_path = input(
-                "Enter the full path of an image or video (or 'exit'): "
+            raw_input_value = input(
+                "\nEnter image/video path, status, or exit: "
             )
 
         except (EOFError, KeyboardInterrupt):
-            print("\nClosing OCR application.")
+            print("\nClosing submitter.")
             break
 
-        raw_path = raw_path.strip().strip('"').strip("'")
+        value = raw_input_value.strip().strip('"').strip("'")
 
-        if raw_path.lower() in {"exit", "quit", "q"}:
-            print(f"\nProcessed {files_processed} file(s) in this session.")
-            print("Closing OCR application.")
+        if not value:
+            continue
+
+        if value.lower() in ("exit", "quit", "q"):
+            log("Submitter closed.")
             break
 
-        if not raw_path:
-            print("Please enter a file path.\n")
-            continue
+        if value.lower() == "status":
+            job_id = input("Enter job ID: ").strip()
 
-        file_path = Path(raw_path).expanduser()
+            if job_id:
+                try:
+                    show_job_status(job_id)
+                except Exception as exc:
+                    log(f"Status lookup failed: {exc}")
 
-        if not file_path.is_file():
-            print(f"ERROR: File not found: {file_path}\n")
-            continue
-
-        file_type = detect_file_type(file_path)
-
-        if file_type is None:
-            print("ERROR: Unsupported file type.")
-            print("Supported images: JPG, PNG, BMP, WEBP, TIF, TIFF")
-            print("Supported videos: MP4, AVI, MOV, MKV, WEBM, M4V\n")
             continue
 
         try:
-            process_one_file(
-                ocr,
-                file_path,
-                file_type,
-                model_load_time
+            submit_job(value)
+
+        except mariadb.Error as exc:
+            log(f"Database error while submitting job: {exc}")
+
+        except Exception as exc:
+            log(
+                f"Submission failed: "
+                f"{type(exc).__name__}: {exc}"
             )
 
-            files_processed += 1
-            print("\nModel remains loaded; ready for the next file.\n")
 
-        except Exception as error:
-            print(
-                f"\nERROR processing {file_path}: "
-                f"{type(error).__name__}: {error}"
-            )
-            print("You can enter another file path, or type 'exit'.\n")
+# ============================================================
+# MAIN ENTRY POINT
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Multilingual Social Media OCR"
+    )
+
+    parser.add_argument(
+        "--worker",
+        action="store_true",
+        help="Start the separate OCR worker process"
+    )
+
+    args = parser.parse_args()
+
+    if args.worker:
+        worker_loop()
+    else:
+        submitter_loop()
 
 
 if __name__ == "__main__":
     main()
+

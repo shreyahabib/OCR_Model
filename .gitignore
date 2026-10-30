@@ -16,6 +16,12 @@ video_ocr_results.json
 Hindi_ocr_results.json
 *.log
 
+# Staged uploads and job results
+uploads/*
+!uploads/.gitkeep
+results/*
+!results/.gitkeep
+
 # Paddle / PaddleX cache
 .paddlex/
 
